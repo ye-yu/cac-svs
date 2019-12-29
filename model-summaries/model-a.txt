@@ -1,0 +1,8 @@
+Relevant Summaries:
+Units on each layer: 1024
+Optimizer: adam defaut
+Layers:
+- LSTM
+- Attention
+Training epochs: 256
+
