@@ -1,0 +1,9 @@
+Relevant Summaries:
+Units on each layer: 1024
+Optimizer: adam default
+Layers:
+- LSTM
+- Dropout (rate=0.2)
+- Attention
+Training epochs: 256
+
