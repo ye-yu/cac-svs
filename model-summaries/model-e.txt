@@ -1,0 +1,11 @@
+Relevant Summaries:
+Sequence size: 20
+Batch size: 512
+Units on each layer: 1024 * 4
+Optimizer: RMSProp 0.00001
+Layers:
+- LSTM
+- Dropout (rate=0.2)
+- Attention
+Training epochs: 256
+

@@ -1,4 +1,6 @@
 Relevant Summaries:
+Sequence size: 30
+Batch size: 1024
 Units on each layer: 1024
 Optimizer: adam defaut
 Layers:
