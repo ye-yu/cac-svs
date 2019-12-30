@@ -1,7 +1,7 @@
 Relevant Summaries:
 Sequence size: 20
 Batch size: 512
-Units on each layer: 1024 * 4
+Units on each layer: 2048
 Optimizer: RMSProp 0.00001
 Layers:
 - LSTM
