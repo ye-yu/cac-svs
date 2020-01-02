@@ -19,8 +19,8 @@ def make_pitch_vocab(destination, *sources):
     inp_int = np.array(list(unique - {RES})).astype(int)
     inp_max = np.max(np.abs(inp_int))
 
-    vocab_range = (np.arange(inp_max * 2 + 1) - inp_max).astype(str)
-    vocab_range = np.append(vocab_range, [RES, SOS, EOS])
+    vocab_range = list((np.arange(inp_max * 2 + 1) - inp_max).astype(str))
+    vocab_range = vocab_range + [RES, SOS, EOS]
 
     with open(destination, 'w') as io:
         io.write(' '.join(vocab_range))
@@ -32,8 +32,8 @@ def make_time_vocab(destination, *sources):
     inp_int = np.array(list(unique - {RES})).astype(int)
     inp_max = np.max(np.abs(inp_int))
 
-    vocab_range = (np.arange(inp_max + 1)).astype(str)
-    vocab_range = np.append(vocab_range, [RES, SOS, EOS])
+    vocab_range = list((np.arange(inp_max + 1) - inp_max).astype(str))
+    vocab_range = vocab_range + [RES, SOS, EOS]
 
     with open(destination, 'w') as io:
         io.write(' '.join(vocab_range))
@@ -51,8 +51,13 @@ if __name__ == "__main__":
         train_file="dataset/text/pitch-input",
         train_vocab="dataset/text/vocabs/pitch-vocab",
         target_file="dataset/text/pitch-target",
-        target_vocab="dataset/text/vocabs/pitch-vocab"
+        target_vocab="dataset/text/vocabs/pitch-vocab",
+        sos=SOS,
+        eos=EOS,
+        batch_size=128,
+        encoder_activation='relu',
+        encoder_dropout=0.2,
+        rnn_units=256
     )
 
     p_model = seq2seq_qi.SequenceModel(p_model_params)
-    print(p_model.train_tokenizer.word_index)
