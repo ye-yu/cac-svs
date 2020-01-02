@@ -1,0 +1,12 @@
+Relevant Summaries:
+Sequence size: 30
+Dataset Augmented Skip 30 times
+Batch size: 2048
+Units on each layer: 1024
+Optimizer: adam LR(0.00001)
+Layers:
+- LSTM, activation ReLU
+- Dropout (rate=0.2)
+- Attention activation Softmax
+Training epochs: 256
+

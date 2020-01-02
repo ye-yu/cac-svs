@@ -1,0 +1,12 @@
+Relevant Summaries:
+Sequence size: 20
+Batch size: 512
+Units on each layer: 512
+Optimizer: Adam 0.00001
+Layers:
+- LSTM
+- Dropout (rate=0.2)
+- LSTM
+- Attention
+Training epochs: 256
+
