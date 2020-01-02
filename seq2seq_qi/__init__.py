@@ -18,6 +18,7 @@ class SeqHParams:
                  sos: str,
                  eos: str,
                  **kwargs):
+        self.name = kwargs.get("name", "seq2seq-model")
         self.train_file = train_file
         self.train_vocab = train_vocab
         self.target_file = target_file
@@ -124,7 +125,7 @@ class SequenceModel:
         else:
             self.optimizer = self.hparams.optimizer(lr=self.hparams.learning_rate)
 
-        self.steps = 1
+        self.steps = len(self.train_tokenized_seq) // self.hparams.batch_size
 
     def initialize_initial_state(self, batch_size):
         return [tf.zeros((batch_size, self.hparams.rnn_units)), tf.zeros((batch_size, self.hparams.rnn_units))]
@@ -144,7 +145,7 @@ class SequenceModel:
             self.decoder.attention_mechanism.setup_memory(a)
             decoder_initial_state = self.decoder.build_decoder_initial_state(self.hparams.batch_size,
                                                                              encoder_state=[a_tx, c_tx],
-                                                                             Dtype=tf.float32)
+                                                                             dtype=tf.float32)
 
             outputs, _, _ = self.decoder.decoder(decoder_emb_inp,
                                                  initial_state=decoder_initial_state,
@@ -157,7 +158,7 @@ class SequenceModel:
             pred = tf.cast(tf.math.argmax(logits, axis=2), tf.int64)
             actu = tf.cast(decoder_output, tf.int64)
             accuracy = tf.math.count_nonzero(actu == pred) / (actu.shape[0] * actu.shape[1])
-            loss = self.loss_function(logits, decoder_output)
+            loss = SequenceModel.loss_function(logits, decoder_output)
 
         variables = self.encoder.trainable_variables + self.encoder.trainable_variables
         gradients = tape.gradient(loss, variables)
@@ -169,14 +170,23 @@ class SequenceModel:
     def loss_function(y_pred,
                       y,
                       sse=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')):
-        loss = sse(y_true=y, y_pred=y_pred)
+        _loss = sse(y_true=y, y_pred=y_pred)
         mask = tf.logical_not(tf.math.equal(y, 0))
-        mask = tf.cast(mask, dtype=loss.dtype)
-        loss = mask * loss
-        loss = tf.reduce_mean(loss)
-        return loss
+        mask = tf.cast(mask, dtype=_loss.dtype)
+        _loss = mask * _loss
+        _loss = tf.reduce_mean(_loss)
+        return _loss
 
-    def run_train(self, epochs):
+    def run_train(self, epochs, verbose=True):
+        if verbose:
+            _print = print
+        else:
+            def _print(*args, **kwargs):
+                return
+        best_acc = 0
+        best_loss = np.inf
+        _print("Training for {} epochs".format(epochs))
+        total_batches = '?'
         for i in range(1, epochs + 1):
             encoder_state = self.initialize_initial_state(self.hparams.batch_size)
             total_loss = total_accuracy = 0.0
@@ -185,9 +195,35 @@ class SequenceModel:
                 batch_loss, batch_accuracy = self._train(input_batch, output_batch, encoder_state)
                 total_loss += batch_loss
                 total_accuracy += batch_accuracy
-            self.logger(i, total_loss, total_accuracy / (batch + 1))
+                _print("\rEpoch {} Batch {}/{} [loss: {:0.04f}, accuracy: {:0.04f}]".format(i,
+                                                                                            batch,
+                                                                                            total_batches,
+                                                                                            total_loss,
+                                                                                            total_accuracy / batch
+                                                                                            ), end='')
+            total_batches = batch + 1
+            total_accuracy /= total_batches
+            _print("\rEpoch {} [loss: {:0.04f}, accuracy: {:0.04f}]".format(i,
+                                                                            total_loss,
+                                                                            total_accuracy
+                                                                            ), end='\n')
+            _print("Best accuracy: {:0.04f} -- Current accuracy: {:0.04f}".format(best_acc, total_accuracy))
+            if best_acc < total_accuracy:
+                print("Accuracy improved.")
+                best_acc = total_accuracy
+            else:
+                _print("Accuracy not improved")
 
-    # @tf.function
+            _print("Best loss: {:0.04f} -- Current loss: {:0.04f}".format(best_loss, total_loss))
+            if best_loss > total_loss:
+                print("Loss improved.")
+                best_loss = total_loss
+            else:
+                _print("Loss not improved")
+
+            self.logger(i, total_loss, total_accuracy)
+
+    @tf.function
     def infer_one(self, untokenized_sequence: list, beam_width: int):
         input_batch = tf.convert_to_tensor(self.target_tokenizer.texts_to_sequences([untokenized_sequence]))
         encoder_initial_cell_state = self.initialize_initial_state(1)
@@ -238,18 +274,21 @@ class SequenceModel:
         return self.target_tokenizer.sequences_to_texts(predictions[0]), tf.math.reduce_max(beam_scores[0], 1).numpy()
 
     def logger(self, epoch, loss, accuracy):
-        print("Epoch: {}, Loss: {:0.06f}, Accuracy: {:0.06f}".format(epoch, loss, accuracy))
         if self.hparams.log_destination:
             with open(self.hparams.log_destination, 'a') as io:
                 io.write("{},{},{}\n".format(epoch, loss, accuracy))
 
-    def save_model(self, destination, name):
-        destination = os.path.join(destination, name)
+    def save_model(self, destination):
+        try:
+            os.mkdir(destination)
+        except FileExistsError as e:
+            pass
+        destination = os.path.join(destination, self.hparams.name)
         self.encoder.save_weights(destination + ".encoder")
         self.decoder.save_weights(destination + ".decoder")
 
-    def load_model(self, source, name):
-        source = os.path.join(source, name)
+    def load_model(self, source):
+        source = os.path.join(source, self.hparams.name)
         self.encoder.load_weights(source + ".encoder")
         self.decoder.load_weights(source + ".decoder")
 
@@ -319,7 +358,7 @@ class _Decoder(tf.keras.Model):
                                                                   attention_norm,
                                                                   None,
                                                                   batch_size * [output_vocab_size])
-        self.rnn_cell = self.build_rnn_cell(batch_size)
+        self.rnn_cell = self.build_rnn_cell()
         self.decoder = tfa.seq2seq.BasicDecoder(self.rnn_cell,
                                                 sampler=self.sampler,
                                                 output_layer=self.dense_layer)
@@ -336,16 +375,15 @@ class _Decoder(tf.keras.Model):
                                                  memory_sequence_length=memory_sequence_length,
                                                  normalize=norm)
 
-    # wrap decodernn cell
-    def build_rnn_cell(self, batch_size):
+    def build_rnn_cell(self):
         rnn_cell = tfa.seq2seq.AttentionWrapper(self.decoder_rnncell,
                                                 self.attention_mechanism,
                                                 attention_layer_size=self.dense_units)
         return rnn_cell
 
-    def build_decoder_initial_state(self, batch_size, encoder_state, Dtype):
+    def build_decoder_initial_state(self, batch_size, encoder_state, dtype):
         decoder_initial_state = self.rnn_cell.get_initial_state(batch_size=batch_size,
-                                                                dtype=Dtype)
+                                                                dtype=dtype)
         decoder_initial_state = decoder_initial_state.clone(cell_state=encoder_state)
         return decoder_initial_state
 
