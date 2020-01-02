@@ -60,4 +60,4 @@ if __name__ == "__main__":
         rnn_units=256
     )
 
-    p_model = seq2seq_qi.SequenceModel(p_model_params)
+

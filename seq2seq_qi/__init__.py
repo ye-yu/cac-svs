@@ -3,6 +3,8 @@
 import tensorflow as tf
 import tensorflow_addons as tfa
 import sys
+import os
+import numpy as np
 
 __all__ = ["SequenceModel"]
 
@@ -45,10 +47,8 @@ class SeqHParams:
         self.rnn_units = kwargs.get("rnn_units", 128)
         self.attention_units = kwargs.get("attention_units", 128)
 
-        if kwargs.get("optimizer_learning_rate"):
-            self.optimizer = kwargs.get("optimizer", tf.keras.optimizers.Adam(lr=kwargs.get("optimizer_learning_rate")))
-        else:
-            self.optimizer = kwargs.get("optimizer", tf.keras.optimizers.Adam())
+        self.optimizer = kwargs.get("optimizer", 'adam')
+        self.learning_rate = kwargs.get("learning_rate", 0.001)
 
         self.batch_size = kwargs.get("batch_size", 64)
         self.log_destination = kwargs.get("log_destination", None)
@@ -91,11 +91,11 @@ class SequenceModel:
         self.target_vocab_size = len(self.target_tokenizer.word_index) + 1
         self.target_max_vocab_len = tf.math.reduce_max([len(t) for t in self.target_tokenized_seq])
 
-        self.batched_dataset = tf.data\
-                                 .Dataset\
-                                 .from_tensor_slices((self.train_tokenized_seq, self.target_tokenized_seq))\
-                                 .shuffle(len(self.train_dataset))\
-                                 .batch(self.hparams.batch_size, drop_remainder=True)
+        self.batched_dataset = tf.data \
+            .Dataset \
+            .from_tensor_slices((self.train_tokenized_seq, self.target_tokenized_seq)) \
+            .shuffle(len(self.train_dataset)) \
+            .batch(self.hparams.batch_size, drop_remainder=True)
 
         self.encoder = _Encoder(self.train_vocab_size,
                                 self.hparams.embedding_size,
@@ -114,6 +114,15 @@ class SequenceModel:
                                 self.hparams.decoder_cell,
                                 self.hparams.decoder_activation,
                                 self.hparams.encoder_dropout)
+
+        if self.hparams.optimizer == 'adam':
+            self.optimizer = tf.keras.optimizers.Adam(lr=self.hparams.learning_rate)
+        elif self.hparams.optimizer == 'rmsprop':
+            self.optimizer = tf.keras.optimizers.RMSprop(lr=self.hparams.learning_rate)
+        elif self.hparams.optimizer == 'sgd':
+            self.optimizer = tf.keras.optimizers.SGD(lr=self.hparams.learning_rate)
+        else:
+            self.optimizer = self.hparams.optimizer(lr=self.hparams.learning_rate)
 
         self.steps = 1
 
@@ -134,25 +143,26 @@ class SequenceModel:
 
             self.decoder.attention_mechanism.setup_memory(a)
             decoder_initial_state = self.decoder.build_decoder_initial_state(self.hparams.batch_size,
-                                                                               encoder_state=[a_tx, c_tx],
-                                                                               Dtype=tf.float32)
+                                                                             encoder_state=[a_tx, c_tx],
+                                                                             Dtype=tf.float32)
 
             outputs, _, _ = self.decoder.decoder(decoder_emb_inp,
                                                  initial_state=decoder_initial_state,
-                                                 sequence_length=self.hparams.batch_size*[self.target_max_vocab_len - 1]
+                                                 sequence_length=self.hparams.batch_size * [
+                                                     self.target_max_vocab_len - 1]
                                                  )
 
             logits = outputs.rnn_output
 
             pred = tf.cast(tf.math.argmax(logits, axis=2), tf.int64)
             actu = tf.cast(decoder_output, tf.int64)
-            accuracy = tf.math.count_nonzero(actu == pred)/(actu.shape[0] * actu.shape[1])
+            accuracy = tf.math.count_nonzero(actu == pred) / (actu.shape[0] * actu.shape[1])
             loss = self.loss_function(logits, decoder_output)
 
         variables = self.encoder.trainable_variables + self.encoder.trainable_variables
         gradients = tape.gradient(loss, variables)
         grads_and_vars = zip(gradients, variables)
-        self.hparams.optimizer.apply_gradients(grads_and_vars)
+        self.optimizer.apply_gradients(grads_and_vars)
         return loss, accuracy
 
     @staticmethod
@@ -177,9 +187,55 @@ class SequenceModel:
                 total_accuracy += batch_accuracy
             self.logger(i, total_loss, total_accuracy / (batch + 1))
 
-    @tf.function
-    def infer_one(self):
-        pass
+    # @tf.function
+    def infer_one(self, untokenized_sequence: list, beam_width: int):
+        input_batch = tf.convert_to_tensor(self.target_tokenizer.texts_to_sequences([untokenized_sequence]))
+        encoder_initial_cell_state = self.initialize_initial_state(1)
+        encoder_emb_inp = self.encoder.encoder_embedding(input_batch)
+        a, a_tx, c_tx = self.encoder.encoder_rnnlayer(encoder_emb_inp,
+                                                      initial_state=encoder_initial_cell_state)
+
+        decoder_input = tf.expand_dims([self.target_tokenizer.word_index[self.hparams.sos]] * 1, 1)
+        self.decoder.decoder_embedding(decoder_input)
+
+        # Build from attention
+        encoder_memory = tfa.seq2seq.tile_batch(a, beam_width)
+        self.decoder.attention_mechanism.setup_memory(encoder_memory)
+
+        # Build decoder state from encoder last state
+        decoder_initial_state = self.decoder.rnn_cell.get_initial_state(batch_size=1 * beam_width,
+                                                                        dtype=tf.float32)
+        encoder_state = tfa.seq2seq.tile_batch([a_tx, c_tx], multiplier=beam_width)
+        decoder_initial_state = decoder_initial_state.clone(cell_state=encoder_state)
+
+        decoder_instance = tfa.seq2seq.BeamSearchDecoder(self.decoder.rnn_cell,
+                                                         beam_width=beam_width,
+                                                         output_layer=self.decoder.dense_layer)
+
+        maximum_iterations = tf.round(tf.reduce_max(self.target_max_vocab_len) * tf.constant(2))
+
+        decoder_embedding_matrix = self.decoder.decoder_embedding.variables[0]
+        start_tokens = tf.fill([1], self.target_tokenizer.word_index[self.hparams.sos])
+        end_token = self.target_tokenizer.word_index[self.hparams.eos]
+
+        (first_finished, first_inputs, first_state) = decoder_instance.initialize(decoder_embedding_matrix,
+                                                                                  start_tokens=start_tokens,
+                                                                                  end_token=end_token,
+                                                                                  initial_state=decoder_initial_state)
+        inputs = first_inputs
+        state = first_state
+        predictions = np.empty((1, beam_width, 0), dtype=np.int32)
+        beam_scores = np.empty((1, beam_width, 0), dtype=np.float32)
+        for j in range(maximum_iterations):
+            beam_search_outputs, next_state, next_inputs, finished = decoder_instance.step(j, inputs, state)
+            inputs = next_inputs
+            state = next_state
+            outputs = np.expand_dims(beam_search_outputs.predicted_ids, axis=-1)
+            scores = np.expand_dims(beam_search_outputs.scores, axis=-1)
+            predictions = np.append(predictions, outputs, axis=-1)
+            beam_scores = np.append(beam_scores, scores, axis=-1)
+
+        return self.target_tokenizer.sequences_to_texts(predictions[0]), tf.math.reduce_max(beam_scores[0], 1).numpy()
 
     def logger(self, epoch, loss, accuracy):
         print("Epoch: {}, Loss: {:0.06f}, Accuracy: {:0.06f}".format(epoch, loss, accuracy))
@@ -187,11 +243,13 @@ class SequenceModel:
             with open(self.hparams.log_destination, 'a') as io:
                 io.write("{},{},{}\n".format(epoch, loss, accuracy))
 
-    def save_model(self, destination):
+    def save_model(self, destination, name):
+        destination = os.path.join(destination, name)
         self.encoder.save_weights(destination + ".encoder")
         self.decoder.save_weights(destination + ".decoder")
 
-    def load_model(self, source):
+    def load_model(self, source, name):
+        source = os.path.join(source, name)
         self.encoder.load_weights(source + ".encoder")
         self.decoder.load_weights(source + ".decoder")
 
@@ -295,4 +353,3 @@ class _Decoder(tf.keras.Model):
 if sys.version_info.major != 3 and sys.version_info.minor != 6 and sys.version_info.micro != 9:
     raise Exception("Version mismatch: Use Python 3.6.9 and Tensorflow 2.0.0. Current interpreter version {}, "
                     "tensorflow version {}".format(sys.version, tf.__version__))
-
