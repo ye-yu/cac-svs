@@ -167,7 +167,7 @@ class SequenceModel:
         self.optimizer.apply_gradients(grads_and_vars)
         return loss, accuracy
 
-    def train(self, epochs, verbose=True):
+    def verbose_train(self, epochs, verbose=True):
         if verbose:
             def _print(*args, color=None, **kwargs):
                 if color == 'red':
@@ -180,16 +180,7 @@ class SequenceModel:
             def _print(*args, **kwargs):
                 return
 
-        def red(text, formatting=""):
-            return ("\033[31m{" + formatting + "}\033[0m").format(text)
-
-        def green(text, formatting=""):
-            return ("\033[32m{" + formatting + "}\033[0m").format(text)
-
-        def yellow(text, formatting=""):
-            return ("\033[33m{" + formatting + "}\033[0m").format(text)
-
-        best_acc = prev_acc = prev_loss = 0
+        best_acc = 0
         best_loss = np.inf
         _print("Training for {} epochs".format(epochs))
         total_batches = '?'
@@ -210,34 +201,56 @@ class SequenceModel:
             total_batches = batch + 1
             total_accuracy /= total_batches
             total_loss /= total_batches
-            _print("\n========================================")
-            _print("          | Previous |   Last |   Best |")
-            _print("----------|----------|--------|--------|")
+            _print("\rEpoch {} [loss: {:0.04f}, accuracy: {:0.04f}]".format(i,
+                                                                            total_loss,
+                                                                            total_accuracy
+                                                                            ), end='\n')
+            _print("Best vs Last Accu: {:0.04f} -> {:0.04f}".format(best_acc, total_accuracy))
+            _print("Best vs Last Loss: {:0.04f} -> {:0.04f}".format(best_loss, total_loss))
+
             if best_acc < total_accuracy:
+                _print("Accuracy improved.", color='green', end='')
                 best_acc = total_accuracy
-                _print(" Accuracy |   {:0.04f} | {} | {} |".format(prev_acc,
-                                                                   green(total_accuracy, ":0.04f"),
-                                                                   yellow(best_acc, ":0.04f")))
             else:
-                _print(" Accuracy |   {:0.04f} | {} | {} |".format(prev_acc,
-                                                                   red(total_accuracy, ":0.04f"),
-                                                                   yellow(best_acc, ":0.04f")))
-            _print("----------|----------|--------|--------|")
+                _print("Accuracy not improved.", color='red', end='')
 
             if best_loss > total_loss:
+                _print("Loss improved.", color='green')
                 best_loss = total_loss
-                _print("     Loss |   {:0.04f} | {} | {} |".format(prev_loss,
-                                                                   green(total_loss, ":0.04f"),
-                                                                   yellow(best_loss, ":0.04f")))
             else:
-                _print("     Loss |   {:0.04f} | {} | {} |".format(prev_loss,
-                                                                   red(total_loss, ":0.04f"),
-                                                                   yellow(best_loss, ":0.04f")))
-            _print("----------|----------|--------|--------|")
+                _print("Loss not improved", color='red')
 
-            prev_acc = total_accuracy
-            prev_loss = total_loss
             self.logger(i, total_loss, total_accuracy)
+
+    def train(self, epochs, verbose=True):
+        if verbose:
+            _print = print
+        else:
+            def _print(*args, **kwargs):
+                return
+        best_acc = 0
+        best_loss = np.inf
+        _print("Training for {} epochs".format(epochs))
+        total_batches = '?'
+        for i in range(1, epochs + 1):
+            encoder_cell_state = self.initialize_initial_state(self.hparams.batch_size)
+            total_loss = 0.0
+            total_accuracy = 0.0
+            print("Epoch", i)
+            batch_loss = tf.constant(0)
+            batch = tf.constant(0)
+            for (batch, (input_batch, output_batch)) in enumerate(self.dataset.take(self.steps)):
+                batch_loss, batch_accuracy = self.train_step(input_batch, output_batch, encoder_cell_state)
+                total_loss += batch_loss
+                total_accuracy += batch_accuracy
+                if (batch + 1) % 20 == 0:
+                    print("  at batch {}".format(batch + 1))
+                    print("  total loss: {}".format(batch_loss.numpy()))
+                    print("  total accuracy: {:0.02f}%".format(100 * total_accuracy / (batch + 1)))
+            print('-' * 25)
+            print("total loss: {}".format(batch_loss.numpy()))
+            print("total accuracy: {:0.02f}%".format(100 * total_accuracy / (batch + 1)))
+
 
     @tf.function
     def infer_one(self, untokenized_sequence: list, beam_width: int):
@@ -385,3 +398,29 @@ class Decoder(tf.keras.Model):
                                                                 dtype=dtype)
         decoder_initial_state = decoder_initial_state.clone(cell_state=encoder_state)
         return decoder_initial_state
+
+
+# start of sequence
+SOS = 'S'
+
+# end of sequence
+EOS = 'E'
+
+# rest note
+RES = 'R'
+
+p_model_params = SeqHParams(
+    name="pitch-model",
+    train_file="dataset/text/pitch-input",
+    train_vocab="dataset/text/vocabs/pitch-vocab",
+    target_file="dataset/text/pitch-target",
+    target_vocab="dataset/text/vocabs/pitch-vocab",
+    sos=SOS,
+    eos=EOS,
+    encoder_activation="tanh",
+    decoder_activation="tanh",
+    attention_normalized=True
+)
+
+p_model = SequenceModel(p_model_params)
+p_model.verbose_train(15)

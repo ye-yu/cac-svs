@@ -1,9 +1,12 @@
-#!/usr/bin/env python
+#! /usr/bin/python
 
 import tensorflow as tf
-import numpy as np
 import tensorflow_addons as tfa
+import sys
 import os
+import numpy as np
+
+__all__ = ["SequenceModel"]
 
 
 class SeqHParams:
@@ -53,12 +56,23 @@ class SeqHParams:
 
 
 class SequenceModel:
-    def __init__(self, hparams):
+    def __init__(self, hparams: SeqHParams):
         self.hparams = hparams
-        with tf.io.gfile.GFile(self.hparams.train_file) as io:
+        self.train_tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='', lower=False)
+        self.target_tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='', lower=False)
+
+        with open(self.hparams.train_vocab) as io:
+            vocab = io.read().split()
+        self.train_tokenizer.fit_on_texts(vocab)
+
+        with open(self.hparams.target_vocab) as io:
+            vocab = io.read().split()
+        self.target_tokenizer.fit_on_texts(vocab)
+
+        with open(self.hparams.train_file) as io:
             self.train_dataset = io.readlines()
 
-        with tf.io.gfile.GFile(self.hparams.target_file) as io:
+        with open(self.hparams.target_file) as io:
             self.target_dataset = io.readlines()
 
         self.train_dataset = [
@@ -66,74 +80,73 @@ class SequenceModel:
         self.target_dataset = [
             "{} {} {}".format(self.hparams.sos, i.strip(), self.hparams.eos) for i in self.target_dataset]
 
-        with tf.io.gfile.GFile(self.hparams.train_vocab) as io:
-            self.train_vocab_lookup = io.read().strip().split()
-        with tf.io.gfile.GFile(self.hparams.target_vocab) as io:
-            self.target_vocab_lookup = io.read().strip().split()
+        self.train_tokenized_seq = self.train_tokenizer.texts_to_sequences(self.train_dataset)
+        self.train_tokenized_seq = tf.keras.preprocessing.sequence.pad_sequences(self.train_tokenized_seq,
+                                                                                 padding='post')
+        self.train_vocab_size = len(self.train_tokenizer.word_index) + 1
+        self.train_max_vocab_len = tf.math.reduce_max([len(t) for t in self.train_tokenized_seq])
 
-        self.train_tokenized_seq, self.train_tokenizer = SequenceModel.tokenize(self.train_dataset,
-                                                                                self.train_vocab_lookup)
-        self.target_tokenized_seq, self.target_tokenizer = SequenceModel.tokenize(self.target_dataset,
-                                                                                  self.target_vocab_lookup)
-
-        self.train_max_vocab_len = SequenceModel.max_len(self.train_tokenized_seq)
-        self.target_max_vocab_len = SequenceModel.max_len(self.target_tokenized_seq)
-
-        self.train_vocab_size = len(self.train_tokenizer.word_index) + 1  # add 1 for 0 sequence character
+        self.target_tokenized_seq = self.target_tokenizer.texts_to_sequences(self.target_dataset)
+        self.target_tokenized_seq = tf.keras.preprocessing.sequence.pad_sequences(self.target_tokenized_seq,
+                                                                                  padding='post')
         self.target_vocab_size = len(self.target_tokenizer.word_index) + 1
+        self.target_max_vocab_len = tf.math.reduce_max([len(t) for t in self.target_tokenized_seq])
 
-        self.buffer_size = len(self.train_tokenized_seq)
-        self.steps = self.buffer_size // self.hparams.batch_size
-
-        self.dataset = (tf.data
-                        .Dataset
-                        .from_tensor_slices((self.train_tokenized_seq, self.target_tokenized_seq))
-                        .shuffle(len(self.train_dataset))
-                        .batch(self.hparams.batch_size, drop_remainder=True))
+        self.batched_dataset = tf.data \
+            .Dataset \
+            .from_tensor_slices((self.train_tokenized_seq, self.target_tokenized_seq)) \
+            .shuffle(len(self.train_dataset)) \
+            .batch(self.hparams.batch_size, drop_remainder=True)
 
         self.encoder = Encoder(self.train_vocab_size,
-                               self.hparams.embedding_size,
-                               self.hparams.rnn_units)
+                                self.hparams.embedding_size,
+                                self.hparams.rnn_units,
+                                self.hparams.encoder_cell,
+                                self.hparams.encoder_dropout)
 
         self.decoder = Decoder(self.target_vocab_size,
-                               self.hparams.embedding_size,
-                               self.hparams.batch_size,
-                               self.hparams.attention,
-                               self.hparams.rnn_units,
-                               self.hparams.attention_units)
+                                self.hparams.embedding_size,
+                                self.hparams.batch_size,
+                                self.hparams.attention,
+                                self.hparams.attention_units,
+                                self.hparams.rnn_units,
+                                self.hparams.decoder_cell)
 
-        self.optimizer = tf.keras.optimizers.Adam()
+        # self.encoder = _Encoder(self.train_vocab_size,
+        #                         self.hparams.embedding_size,
+        #                         self.hparams.rnn_units,
+        #                         self.hparams.encoder_cell,
+        #                         self.hparams.encoder_activation,
+        #                         self.hparams.encoder_dropout)
+        #
+        # self.decoder = _Decoder(self.target_vocab_size,
+        #                         self.hparams.embedding_size,
+        #                         self.hparams.batch_size,
+        #                         self.hparams.attention,
+        #                         self.hparams.attention_normalized,
+        #                         self.hparams.attention_units,
+        #                         self.hparams.rnn_units,
+        #                         self.hparams.decoder_cell,
+        #                         self.hparams.decoder_activation,
+        #                         self.hparams.decoder_dropout)
+        #
+        if self.hparams.optimizer == 'adam':
+            self.optimizer = tf.keras.optimizers.Adam(lr=self.hparams.learning_rate)
+        elif self.hparams.optimizer == 'rmsprop':
+            self.optimizer = tf.keras.optimizers.RMSprop(lr=self.hparams.learning_rate)
+        elif self.hparams.optimizer == 'sgd':
+            self.optimizer = tf.keras.optimizers.SGD(lr=self.hparams.learning_rate)
+        else:
+            self.optimizer = self.hparams.optimizer(lr=self.hparams.learning_rate)
 
-    @staticmethod
-    def tokenize(d, lookup):
-        tokenizer = tf.keras.preprocessing.text.Tokenizer(filters='', lower=False)
-        tokenizer.fit_on_texts(lookup)
-        sequences = tokenizer.texts_to_sequences(d)
+        self.steps = len(self.train_tokenized_seq) // self.hparams.batch_size
+        self.loss_function = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')
 
-        sequences = tf.keras.preprocessing.sequence.pad_sequences(sequences, padding='post')
-        return sequences, tokenizer
-
-    @staticmethod
-    def max_len(tensor):
-        return max(len(t) for t in tensor)
-
-    @staticmethod
-    def loss_function(y_pred,
-                      y,
-                      sse=tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction='none')):
-        loss = sse(y_true=y, y_pred=y_pred)
-        mask = tf.logical_not(tf.math.equal(y, 0))  # output 0 for y=0 else output 1
-        mask = tf.cast(mask, dtype=loss.dtype)
-        loss = mask * loss
-        loss = tf.reduce_mean(loss)
-        return loss
-
-    def initialize_initial_state(self, bs):
-        return [tf.zeros((bs, self.hparams.rnn_units)), tf.zeros((bs, self.hparams.rnn_units))]
+    def initialize_initial_state(self, batch_size):
+        return [tf.zeros((batch_size, self.hparams.rnn_units)), tf.zeros((batch_size, self.hparams.rnn_units))]
 
     @tf.function
-    def train_step(self, input_batch, output_batch, encoder_initial_cell_state):
-        # initialize loss = 0
+    def _train(self, input_batch, output_batch, encoder_initial_cell_state):
         with tf.GradientTape() as tape:
             encoder_emb_inp = self.encoder.encoder_embedding(input_batch)
             a, a_tx, c_tx = self.encoder.encoder_rnnlayer(encoder_emb_inp,
@@ -152,22 +165,28 @@ class SequenceModel:
             outputs, _, _ = self.decoder.decoder(decoder_emb_inp,
                                                  initial_state=decoder_initial_state,
                                                  sequence_length=self.hparams.batch_size * [
-                                                     self.target_max_vocab_len - 1])
+                                                     self.target_max_vocab_len - 1]
+                                                 )
 
             logits = outputs.rnn_output
+
             pred = tf.cast(tf.math.argmax(logits, axis=2), tf.int64)
             actu = tf.cast(decoder_output, tf.int64)
             accuracy = tf.math.count_nonzero(actu == pred) / (actu.shape[0] * actu.shape[1])
-            loss = SequenceModel.loss_function(logits, decoder_output)
 
-        variables = self.encoder.trainable_variables + self.decoder.trainable_variables
+            loss = self.loss_function(decoder_output, logits)
+            mask = tf.logical_not(tf.math.equal(decoder_output, 0))
+            mask = tf.cast(mask, dtype=loss.dtype)
+            loss = mask * loss
+            loss = tf.reduce_mean(loss)
+
+        variables = self.encoder.trainable_variables + self.encoder.trainable_variables
         gradients = tape.gradient(loss, variables)
-
         grads_and_vars = zip(gradients, variables)
         self.optimizer.apply_gradients(grads_and_vars)
         return loss, accuracy
 
-    def train(self, epochs, verbose=True):
+    def run_train(self, epochs, verbose=True):
         if verbose:
             def _print(*args, color=None, **kwargs):
                 if color == 'red':
@@ -180,16 +199,7 @@ class SequenceModel:
             def _print(*args, **kwargs):
                 return
 
-        def red(text, formatting=""):
-            return ("\033[31m{" + formatting + "}\033[0m").format(text)
-
-        def green(text, formatting=""):
-            return ("\033[32m{" + formatting + "}\033[0m").format(text)
-
-        def yellow(text, formatting=""):
-            return ("\033[33m{" + formatting + "}\033[0m").format(text)
-
-        best_acc = prev_acc = prev_loss = 0
+        best_acc = 0
         best_loss = np.inf
         _print("Training for {} epochs".format(epochs))
         total_batches = '?'
@@ -197,8 +207,8 @@ class SequenceModel:
             encoder_state = self.initialize_initial_state(self.hparams.batch_size)
             total_loss = total_accuracy = 0.0
             batch = 0
-            for (batch, (input_batch, output_batch)) in enumerate(self.dataset.take(self.steps)):
-                batch_loss, batch_accuracy = self.train_step(input_batch, output_batch, encoder_state)
+            for (batch, (input_batch, output_batch)) in enumerate(self.batched_dataset.take(self.steps)):
+                batch_loss, batch_accuracy = self._train(input_batch, output_batch, encoder_state)
                 total_loss += batch_loss
                 total_accuracy += batch_accuracy
                 _print("\rEpoch {} Batch {}/{} [loss: {:0.04f}, accuracy: {:0.04f}]".format(i,
@@ -210,33 +220,25 @@ class SequenceModel:
             total_batches = batch + 1
             total_accuracy /= total_batches
             total_loss /= total_batches
-            _print("\n========================================")
-            _print("          | Previous |   Last |   Best |")
-            _print("----------|----------|--------|--------|")
+            _print("\rEpoch {} [loss: {:0.04f}, accuracy: {:0.04f}]".format(i,
+                                                                            total_loss,
+                                                                            total_accuracy
+                                                                            ), end='\n')
+            _print("Best vs Last Accu: {:0.04f} -> {:0.04f}".format(best_acc, total_accuracy))
+            _print("Best vs Last Loss: {:0.04f} -> {:0.04f}".format(best_loss, total_loss))
+
             if best_acc < total_accuracy:
+                _print("Accuracy improved.", color='green', end='')
                 best_acc = total_accuracy
-                _print(" Accuracy |   {:0.04f} | {} | {} |".format(prev_acc,
-                                                                   green(total_accuracy, ":0.04f"),
-                                                                   yellow(best_acc, ":0.04f")))
             else:
-                _print(" Accuracy |   {:0.04f} | {} | {} |".format(prev_acc,
-                                                                   red(total_accuracy, ":0.04f"),
-                                                                   yellow(best_acc, ":0.04f")))
-            _print("----------|----------|--------|--------|")
+                _print("Accuracy not improved.", color='red', end='')
 
             if best_loss > total_loss:
+                _print("Loss improved.", color='green')
                 best_loss = total_loss
-                _print("     Loss |   {:0.04f} | {} | {} |".format(prev_loss,
-                                                                   green(total_loss, ":0.04f"),
-                                                                   yellow(best_loss, ":0.04f")))
             else:
-                _print("     Loss |   {:0.04f} | {} | {} |".format(prev_loss,
-                                                                   red(total_loss, ":0.04f"),
-                                                                   yellow(best_loss, ":0.04f")))
-            _print("----------|----------|--------|--------|")
+                _print("Loss not improved", color='red')
 
-            prev_acc = total_accuracy
-            prev_loss = total_loss
             self.logger(i, total_loss, total_accuracy)
 
     @tf.function
@@ -328,6 +330,33 @@ class Encoder(tf.keras.Model):
             raise ValueError('Cell type unsupported:', rnn_cell_type)
 
 
+class _Encoder(tf.keras.Model):
+    def __init__(self,
+                 input_vocab_size,
+                 embedding_dims,
+                 rnn_units,
+                 rnn_cell_type,
+                 activation,
+                 dropout):
+        super().__init__()
+        self.encoder_embedding = tf.keras.layers.Embedding(input_dim=input_vocab_size,
+                                                           output_dim=embedding_dims)
+        if rnn_cell_type == 'lstm':
+            self.encoder_rnnlayer = tf.keras.layers.LSTM(rnn_units,
+                                                         return_sequences=True,
+                                                         return_state=True,
+                                                         dropout=dropout,
+                                                         activation=activation)
+        elif rnn_cell_type == 'gru':
+            self.encoder_rnnlayer = tf.keras.layers.GRU(rnn_units,
+                                                        return_sequences=True,
+                                                        return_state=True,
+                                                        dropout=dropout,
+                                                        activation=activation)
+        else:
+            raise ValueError('Cell type unsupported:', rnn_cell_type)
+
+
 class Decoder(tf.keras.Model):
     def __init__(self,
                  output_vocab_size,
@@ -385,3 +414,76 @@ class Decoder(tf.keras.Model):
                                                                 dtype=dtype)
         decoder_initial_state = decoder_initial_state.clone(cell_state=encoder_state)
         return decoder_initial_state
+
+
+class _Decoder(tf.keras.Model):
+    def __init__(self,
+                 output_vocab_size: int,
+                 embedding_dims: int,
+                 batch_size: int,
+                 attention: str,
+                 attention_norm: bool,
+                 dense_units: int,
+                 rnn_units: int,
+                 rnn_cell_type: str,
+                 rnn_activation: str,
+                 dropout: float):
+        super().__init__()
+        self.decoder_embedding = tf.keras.layers.Embedding(input_dim=output_vocab_size,
+                                                           output_dim=embedding_dims)
+
+        self.dense_layer = tf.keras.layers.Dense(output_vocab_size)
+
+        if rnn_cell_type == 'lstm':
+            self.decoder_rnncell = tf.keras.layers.LSTMCell(rnn_units,
+                                                            dropout=dropout,
+                                                            activation=rnn_activation)
+        elif rnn_cell_type == 'gru':
+            self.decoder_rnncell = tf.keras.layers.GRUCell(rnn_units,
+                                                           dropout=dropout,
+                                                           activation=rnn_activation)
+        else:
+            raise ValueError('Cell type unsupported:', rnn_cell_type)
+
+        self.dense_units = dense_units
+        # Sampler
+        self.sampler = tfa.seq2seq.sampler.TrainingSampler()
+
+        # Create attention mechanism with memory = None
+        self.attention_mechanism = self.build_attention_mechanism(attention,
+                                                                  attention_norm,
+                                                                  None,
+                                                                  batch_size * [output_vocab_size])
+        self.rnn_cell = self.build_rnn_cell()
+        self.decoder = tfa.seq2seq.BasicDecoder(self.rnn_cell,
+                                                sampler=self.sampler,
+                                                output_layer=self.dense_layer)
+
+    def build_attention_mechanism(self, attention_type, norm, memory, memory_sequence_length):
+        if attention_type == 'luong':
+            return tfa.seq2seq.LuongAttention(self.dense_units,
+                                              memory=memory,
+                                              memory_sequence_length=memory_sequence_length,
+                                              normalize=norm)
+        elif attention_type == 'bahdanau':
+            return tfa.seq2seq.BahdanauAttention(self.dense_units,
+                                                 memory=memory,
+                                                 memory_sequence_length=memory_sequence_length,
+                                                 normalize=norm)
+
+    def build_rnn_cell(self):
+        rnn_cell = tfa.seq2seq.AttentionWrapper(self.decoder_rnncell,
+                                                self.attention_mechanism,
+                                                attention_layer_size=self.dense_units)
+        return rnn_cell
+
+    def build_decoder_initial_state(self, batch_size, encoder_state, dtype):
+        decoder_initial_state = self.rnn_cell.get_initial_state(batch_size=batch_size,
+                                                                dtype=dtype)
+        decoder_initial_state = decoder_initial_state.clone(cell_state=encoder_state)
+        return decoder_initial_state
+
+
+if sys.version_info.major != 3 and sys.version_info.minor != 6 and sys.version_info.micro != 9:
+    raise Exception("Version mismatch: Use Python 3.6.9 and Tensorflow 2.0.0. Current interpreter version {}, "
+                    "tensorflow version {}".format(sys.version, tf.__version__))
