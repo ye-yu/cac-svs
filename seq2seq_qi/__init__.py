@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-
+import time
 import tensorflow as tf
 import numpy as np
 import tensorflow_addons as tfa
@@ -23,33 +23,33 @@ class SeqHParams:
         self.sos = sos
         self.eos = eos
 
-        if kwargs.get("use_same_cell_type", False):
-            self.encoder_cell = self.decoder_cell = kwargs.get("cell_type", "lstm")
-        else:
-            self.encoder_cell = kwargs.get("encoder_cell_type", "lstm")
-            self.decoder_cell = kwargs.get("decoder_cell_type", "lstm")
-
-        self.attention = kwargs.get("attention", "bahdanau")
-        self.attention_normalized = kwargs.get("attention_normalized", False)
-
-        if kwargs.get("use_same_cell_dropout", False):
-            self.encoder_dropout = self.decoder_dropout = kwargs.get("dropout", 0.0)
-        else:
-            self.encoder_dropout = kwargs.get("encoder_dropout", 0.0)
-            self.decoder_dropout = kwargs.get("decoder_dropout", 0.0)
-
-        self.encoder_activation = kwargs.get("encoder_activation", "sigmoid")
-        self.decoder_activation = kwargs.get("decoder_activation", "sigmoid")
-
+        self.batch_size = kwargs.get("batch_size", 64)
         self.embedding_size = kwargs.get("embedding_size", 128)
         self.rnn_units = kwargs.get("rnn_units", 128)
+
+        self.encoder_cell = kwargs.get("encoder_cell_type", "lstm")
+        self.encoder_embedding_dropout = kwargs.get("encoder_embedding_dropout", 0.0)
+        self.encoder_rnn_dropout = kwargs.get("encoder_rnn_dropout", 0.0)
+        self.encoder_activation = kwargs.get("encoder_activation", "sigmoid")
+
+        self.decoder_cell = kwargs.get("decoder_cell_type", "lstm")
+        self.decoder_embedding_dropout = kwargs.get("decoder_embedding_dropout", 0.0)
+        self.decoder_rnn_dropout = kwargs.get("decoder_rnn_dropout", 0.0)
+        self.decoder_activation = kwargs.get("decoder_activation", "sigmoid")
+
         self.attention_units = kwargs.get("attention_units", 128)
+        self.attention = kwargs.get("attention", "bahdanau")
+        self.attention_normalized = kwargs.get("attention_normalized", False)
 
         self.optimizer = kwargs.get("optimizer", 'adam')
         self.learning_rate = kwargs.get("learning_rate", 0.001)
 
-        self.batch_size = kwargs.get("batch_size", 64)
         self.log_destination = kwargs.get("log_destination", None)
+
+    def update(self, dict_, **kwargs):
+        kwargs.update(dict_)
+        for i, k in enumerate(kwargs):
+            setattr(self, k, kwargs[k])
 
 
 class SequenceModel:
@@ -93,16 +93,33 @@ class SequenceModel:
 
         self.encoder = Encoder(self.train_vocab_size,
                                self.hparams.embedding_size,
-                               self.hparams.rnn_units)
+                               self.hparams.rnn_units,
+                               rnn_dropout=self.hparams.encoder_rnn_dropout,
+                               rnn_cell_type=self.hparams.encoder_cell,
+                               rnn_activation=self.hparams.encoder_activation)
 
         self.decoder = Decoder(self.target_vocab_size,
                                self.hparams.embedding_size,
-                               self.hparams.batch_size,
-                               self.hparams.attention,
+                               self.hparams.attention_units,
                                self.hparams.rnn_units,
-                               self.hparams.attention_units)
+                               self.hparams.batch_size,
+                               attention_type=self.hparams.attention,
+                               rnn_dropout=self.hparams.decoder_rnn_dropout,
+                               rnn_cell_type=self.hparams.decoder_cell,
+                               rnn_activation=self.hparams.decoder_activation)
 
-        self.optimizer = tf.keras.optimizers.Adam()
+        if self.hparams.optimizer == 'adam':
+            self.optimizer = tf.keras.optimizers.Adam(lr=self.hparams.learning_rate)
+        elif self.hparams.optimizer == 'rmsprop':
+            self.optimizer = tf.keras.optimizers.RMSprop(lr=self.hparams.learning_rate)
+        elif self.hparams.optimizer == 'sgd':
+            self.optimizer = tf.keras.optimizers.SGD(lr=self.hparams.learning_rate)
+        else:
+            raise ValueError("Optimizer type not understood", self.hparams.optimizer)
+
+    def print_attr(self):
+        for i, k in enumerate(self.__dict__):
+            print(k, self.__dict__[k])
 
     @staticmethod
     def tokenize(d, lookup):
@@ -133,7 +150,6 @@ class SequenceModel:
 
     @tf.function
     def train_step(self, input_batch, output_batch, encoder_initial_cell_state):
-        # initialize loss = 0
         with tf.GradientTape() as tape:
             encoder_emb_inp = self.encoder.encoder_embedding(input_batch)
             a, a_tx, c_tx = self.encoder.encoder_rnnlayer(encoder_emb_inp,
@@ -192,22 +208,25 @@ class SequenceModel:
         best_acc = prev_acc = prev_loss = 0
         best_loss = np.inf
         _print("Training for {} epochs".format(epochs))
-        total_batches = '?'
+        total_batches = self.steps
         for i in range(1, epochs + 1):
+            start = time.time()
             encoder_state = self.initialize_initial_state(self.hparams.batch_size)
             total_loss = total_accuracy = 0.0
             batch = 0
             for (batch, (input_batch, output_batch)) in enumerate(self.dataset.take(self.steps)):
+                batch += 1
                 batch_loss, batch_accuracy = self.train_step(input_batch, output_batch, encoder_state)
                 total_loss += batch_loss
                 total_accuracy += batch_accuracy
-                _print("\rEpoch {} Batch {}/{} [loss: {:0.04f}, accuracy: {:0.04f}]".format(i,
-                                                                                            batch,
-                                                                                            total_batches,
-                                                                                            total_loss / batch,
-                                                                                            total_accuracy / batch
-                                                                                            ), end='')
-            total_batches = batch + 1
+                _print("\rEpoch {} Batch {}/{}"
+                       " [loss: {:0.04f}, accuracy: {:0.04f}, time: {:0.02f}s]".format(i,
+                                                                                       batch,
+                                                                                       total_batches,
+                                                                                       total_loss / batch,
+                                                                                       total_accuracy / batch,
+                                                                                       time.time() - start
+                                                                                       ), end='')
             total_accuracy /= total_batches
             total_loss /= total_batches
             _print("\n========================================")
@@ -234,7 +253,8 @@ class SequenceModel:
                                                                    red(total_loss, ":0.04f"),
                                                                    yellow(best_loss, ":0.04f")))
             _print("----------|----------|--------|--------|")
-
+            completion = (time.time() - start) * (epochs - i)
+            _print("Expected duration of completion: {:0.02f} more seconds".format(completion))
             prev_acc = total_accuracy
             prev_loss = total_loss
             self.logger(i, total_loss, total_accuracy)
@@ -310,43 +330,57 @@ class SequenceModel:
 
 
 class Encoder(tf.keras.Model):
-    def __init__(self, input_vocab_size, embedding_dims, rnn_units, rnn_cell_type='lstm', dropout=0.0):
+    def __init__(self,
+                 vocab_size,
+                 embedding_size,
+                 rnn_units,
+                 rnn_dropout=0.0,
+                 rnn_cell_type='lstm',
+                 rnn_activation='tanh'):
         super().__init__()
-        self.encoder_embedding = tf.keras.layers.Embedding(input_dim=input_vocab_size,
-                                                           output_dim=embedding_dims)
+        self.encoder_embedding = tf.keras.layers.Embedding(input_dim=vocab_size,
+                                                           output_dim=embedding_size)
         if rnn_cell_type == 'lstm':
             self.encoder_rnnlayer = tf.keras.layers.LSTM(rnn_units,
                                                          return_sequences=True,
                                                          return_state=True,
-                                                         dropout=dropout)
+                                                         dropout=rnn_dropout,
+                                                         activation=rnn_activation)
         elif rnn_cell_type == 'gru':
             self.encoder_rnnlayer = tf.keras.layers.GRU(rnn_units,
                                                         return_sequences=True,
                                                         return_state=True,
-                                                        dropout=dropout)
+                                                        dropout=rnn_dropout,
+                                                        activation=rnn_activation)
         else:
             raise ValueError('Cell type unsupported:', rnn_cell_type)
 
 
 class Decoder(tf.keras.Model):
     def __init__(self,
-                 output_vocab_size,
-                 embedding_dims,
-                 batch_size,
-                 attention,
+                 vocab_size,
+                 embedding_size,
                  dense_units,
                  rnn_units,
-                 rnn_cell_type='lstm'):
+                 batch_size,
+                 attention_type='bahdanau',
+                 rnn_dropout=0.0,
+                 rnn_cell_type='lstm',
+                 rnn_activation='tanh'):
         super().__init__()
-        self.decoder_embedding = tf.keras.layers.Embedding(input_dim=output_vocab_size,
-                                                           output_dim=embedding_dims)
+        self.decoder_embedding = tf.keras.layers.Embedding(input_dim=vocab_size,
+                                                           output_dim=embedding_size)
 
-        self.dense_layer = tf.keras.layers.Dense(output_vocab_size)
+        self.dense_layer = tf.keras.layers.Dense(vocab_size)
 
         if rnn_cell_type == 'lstm':
-            self.decoder_rnncell = tf.keras.layers.LSTMCell(rnn_units)
+            self.decoder_rnncell = tf.keras.layers.LSTMCell(rnn_units,
+                                                            activation=rnn_activation,
+                                                            dropout=rnn_dropout)
         elif rnn_cell_type == 'gru':
-            self.decoder_rnncell = tf.keras.layers.GRUCell(rnn_units)
+            self.decoder_rnncell = tf.keras.layers.GRUCell(rnn_units,
+                                                           activation=rnn_activation,
+                                                           dropout=rnn_dropout)
         else:
             raise ValueError('Cell type unsupported:', rnn_cell_type)
 
@@ -355,9 +389,9 @@ class Decoder(tf.keras.Model):
         self.sampler = tfa.seq2seq.sampler.TrainingSampler()
 
         # Create attention mechanism with memory = None
-        self.attention_mechanism = self.build_attention_mechanism(attention,
+        self.attention_mechanism = self.build_attention_mechanism(attention_type,
                                                                   None,
-                                                                  batch_size * [output_vocab_size])
+                                                                  batch_size * [vocab_size])
         self.rnn_cell = self.build_rnn_cell()
         self.decoder = tfa.seq2seq.BasicDecoder(self.rnn_cell,
                                                 sampler=self.sampler,
